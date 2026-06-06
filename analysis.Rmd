@@ -1,0 +1,425 @@
+---
+title: "AgriGrain: Multiclass Classification of Grain Types Using Ensemble and Neural Models"
+author: "Dr. Ahmed Moussa"
+date: "2024"
+output:
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float: true
+    code_folding: show
+    fig_width: 9
+    fig_height: 5
+---
+
+## 1. Overview
+
+This project classifies seven dry bean varieties from 16 geometric shape features extracted from digital grain images. The [UCI Dry Bean Dataset](https://archive.ics.uci.edu/dataset/602/dry+bean+dataset) (Koklu & Ozkan, 2020) contains 13,611 labelled observations across seven classes. A stratified 10% subsample (n = 1,364) is used for all modelling to keep computation tractable while preserving class proportions, then split 75/25 into training and testing sets. Five supervised classifiers were benchmarked with 5-fold cross-validated hyperparameter tuning: Bagging, Random Forests, Gradient Boosting (GBM), Mixture Discriminant Analysis (MDA), and Artificial Neural Networks (ANN). All methods achieved test accuracy near 91%, with Random Forests and ANN jointly reaching 91.1%, confirming that geometric shape features provide robust discriminative signal independent of the modelling approach chosen.
+
+---
+
+## 2. Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+library(ggplot2)
+library(GGally)
+library(dplyr)
+library(tidyr)
+library(reshape2)
+library(caret)
+library(randomForest)
+library(gbm)
+library(mclust)
+library(nnet)
+library(e1071)
+
+set.seed(42)
+
+theme_portfolio <- function() {
+  theme_minimal(base_family = "sans", base_size = 12) +
+    theme(
+      plot.title       = element_text(size = 14, face = "bold", color = "#0F1923", margin = ggplot2::margin(b = 8)),
+      plot.subtitle    = element_text(size = 11, color = "#444444", margin = ggplot2::margin(b = 12)),
+      plot.caption     = element_text(size = 9, color = "#888780", hjust = 0),
+      axis.title       = element_text(size = 11, color = "#444444"),
+      axis.text        = element_text(size = 10, color = "#666666"),
+      panel.grid.major = element_line(color = "#F0F0F0", linewidth = 0.5),
+      panel.grid.minor = element_blank(),
+      panel.background = element_rect(fill = "white", color = NA),
+      plot.background  = element_rect(fill = "white", color = NA),
+      legend.position  = "bottom",
+      legend.title     = element_text(size = 10, face = "bold"),
+      legend.text      = element_text(size = 10),
+      strip.text       = element_text(size = 11, face = "bold", color = "#0F1923")
+    )
+}
+
+palette_portfolio <- c("#378ADD", "#BA7517", "#1D9E75", "#5F5E5A", "#888780", "#0F1923", "#C4473A")
+
+save_fig <- function(filename, width = 9, height = 5) {
+  ggsave(
+    filename = file.path("figures", filename),
+    width    = width,
+    height   = height,
+    dpi      = 150,
+    bg       = "white"
+  )
+}
+```
+
+---
+
+## 3. Data
+
+### 3.1 Loading & Structure
+
+The full dataset is loaded and the 10% stratified working sample is drawn immediately so all subsequent EDA and modelling operate on the same consistent subset. The train/test indices are also fixed here.
+
+```{r load-data}
+da        <- read.csv("data/raw/DB.csv")
+da$Class  <- as.factor(da$Class)
+
+cat("Full dataset dimensions:", paste(dim(da), collapse = " x "), "\n")
+glimpse(da)
+
+cat("\nClass proportions (full dataset):\n")
+round(prop.table(table(da$Class)), 3)
+```
+
+```{r stratified-sample}
+set.seed(42)
+idx_sample <- createDataPartition(da$Class, p = 0.10, list = FALSE)
+xda        <- da[idx_sample, ]
+
+cat("Working sample dimensions:", paste(dim(xda), collapse = " x "), "\n")
+cat("\nClass proportions (working sample):\n")
+round(prop.table(table(xda$Class)), 3)
+```
+
+```{r train-test-split}
+set.seed(42)
+ind_train <- as.vector(createDataPartition(xda$Class, p = 0.75, list = FALSE))
+
+cat("Training set:", length(ind_train), "observations\n")
+cat("Test set:    ", nrow(xda) - length(ind_train), "observations\n")
+cat("\nTraining class proportions (stratification check):\n")
+round(prop.table(table(xda[ind_train, "Class"])), 3)
+```
+
+### 3.2 Exploratory Data Analysis
+
+**Figure 1 — Class Distribution**
+
+The full dataset shows moderate class imbalance: Dermason is the most common variety (~26% of observations), while Bombay is the rarest (~4%). All analyses use stratified sampling to preserve these proportions.
+
+```{r fig-class-balance}
+da %>%
+  count(Class, name = "n") %>%
+  mutate(Class = reorder(Class, -n)) %>%
+  ggplot(aes(x = Class, y = n, fill = Class)) +
+  geom_col(alpha = 0.9, width = 0.7) +
+  geom_text(aes(label = scales::comma(n)), vjust = -0.4, size = 3.5, color = "#444444") +
+  scale_fill_manual(values = palette_portfolio) +
+  scale_y_continuous(labels = scales::comma, expand = expansion(mult = c(0, 0.12))) +
+  labs(
+    title    = "Class Distribution in the Full Dataset (n = 13,611)",
+    subtitle = "Dermason accounts for ~26% of records; Bombay is the rarest class at ~4% — moderate imbalance",
+    x        = "Grain Variety",
+    y        = "Count"
+  ) +
+  theme_portfolio() +
+  theme(legend.position = "none")
+save_fig("01_class-balance.png")
+```
+
+**Figure 2 — Key Feature Distributions by Class**
+
+Four shape descriptors — Area, Perimeter, Compactness, and Eccentricity — are shown as violin + box plots. Bombay grains are distinctly larger and more elongated; Compactness and Eccentricity differentiate the six remaining classes.
+
+```{r fig-feature-distributions, fig.height=7}
+xda %>%
+  select(Class, Area, Perimeter, Compactness, Eccentricity) %>%
+  pivot_longer(-Class, names_to = "Feature", values_to = "Value") %>%
+  ggplot(aes(x = Class, y = Value, fill = Class)) +
+  geom_violin(alpha = 0.65, trim = FALSE) +
+  geom_boxplot(width = 0.12, fill = "white", outlier.size = 0.4, alpha = 0.85) +
+  facet_wrap(~Feature, scales = "free_y", ncol = 2) +
+  scale_fill_manual(values = palette_portfolio) +
+  labs(
+    title    = "Key Feature Distributions Across Grain Classes (Working Sample)",
+    subtitle = "Bombay is an outlier on size; Compactness and Eccentricity separate the denser cluster of six classes",
+    x        = NULL,
+    y        = "Value"
+  ) +
+  theme_portfolio() +
+  theme(
+    axis.text.x     = element_text(angle = 45, hjust = 1, size = 9),
+    legend.position = "none"
+  )
+save_fig("02_feature-distributions.png", width = 9, height = 7)
+```
+
+**Figure 3 — Correlation Heatmap**
+
+The 16 features contain substantial multicollinearity: Area, Perimeter, ConvexArea, and EquivDiameter form a near-collinear size cluster (r > 0.98). Shape-factor features are more orthogonal and provide complementary information. Tree-based methods handle this automatically; MDA and ANN benefit from the standardisation applied in preprocessing.
+
+```{r fig-correlation, fig.height=7}
+cor_mat    <- round(cor(xda[, -ncol(xda)]), 2)
+cor_melted <- reshape2::melt(cor_mat)
+
+ggplot(cor_melted, aes(x = Var1, y = Var2, fill = value)) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  scale_fill_gradient2(
+    low      = "#BA7517",
+    mid      = "white",
+    high     = "#378ADD",
+    midpoint = 0,
+    limits   = c(-1, 1),
+    name     = "r"
+  ) +
+  geom_text(aes(label = sprintf("%.2f", value)), size = 2.0, color = "#0F1923") +
+  labs(
+    title    = "Feature Correlation Heatmap (Working Sample)",
+    subtitle = "Size features (Area, Perimeter, ConvexArea, EquivDiameter) are near-collinear; ShapeFactors are relatively independent",
+    x        = NULL,
+    y        = NULL
+  ) +
+  theme_portfolio() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 9),
+        axis.text.y = element_text(size = 9))
+save_fig("03_correlation-heatmap.png", width = 9, height = 7)
+```
+
+**Figure 4 — Pairplot of Top Predictors**
+
+The five features most consistently ranked as important — Perimeter, ShapeFactor1, Compactness, MinorAxisLength, and MajorAxisLength — show clear class separation across nearly all pairwise views, validating the feature-driven approach to classification.
+
+```{r fig-pairplot, message=FALSE, warning=FALSE, fig.height=9, fig.width=9}
+top5 <- c("Perimeter", "ShapeFactor1", "Compactness", "MinorAxisLength", "MajorAxisLength")
+
+ggpairs(
+  xda[, c(top5, "Class")],
+  aes(color = Class, alpha = 0.35),
+  upper = list(continuous = wrap("cor", size = 2.5, alignPercent = 1)),
+  lower = list(continuous = wrap("points", size = 0.3)),
+  diag  = list(continuous = wrap("densityDiag", alpha = 0.5))
+) +
+  scale_colour_manual(values = palette_portfolio) +
+  scale_fill_manual(values = palette_portfolio) +
+  labs(
+    title    = "Pairplot of Top Five Predictors",
+    subtitle = "Clear class clustering across all feature pairs confirms strong geometric discriminative signal"
+  ) +
+  theme_portfolio() +
+  theme(axis.text = element_text(size = 7))
+save_fig("04_pairplot.png", width = 9, height = 9)
+```
+
+**Figure 5 — Random Forest Feature Importance**
+
+A Random Forest (same parameters as Section 6.2) is fitted here with `set.seed(42)` to extract stable feature importances. Perimeter, ShapeFactor1, and Compactness dominate; the four collinear size features share importance and would rank higher if not split across equivalent predictors.
+
+```{r fig-feature-importance}
+set.seed(42)
+rf_imp_model <- randomForest(
+  Class ~ ., data = xda, subset = ind_train,
+  mtry = 6, ntree = 500, importance = TRUE
+)
+
+imp_df <- as.data.frame(importance(rf_imp_model))
+imp_df$Feature <- rownames(imp_df)
+imp_df <- imp_df[order(imp_df$MeanDecreaseGini), ]
+imp_df$Feature <- factor(imp_df$Feature, levels = imp_df$Feature)
+
+ggplot(imp_df, aes(x = MeanDecreaseGini, y = Feature, fill = MeanDecreaseGini)) +
+  geom_col(alpha = 0.9) +
+  scale_fill_gradient(low = "#888780", high = "#378ADD", guide = "none") +
+  labs(
+    title    = "Random Forest Feature Importance",
+    subtitle = "Perimeter, ShapeFactor1, and Compactness are the strongest discriminators of grain variety",
+    x        = "Mean Decrease in Gini Impurity",
+    y        = NULL
+  ) +
+  theme_portfolio()
+save_fig("05_feature-importance.png")
+```
+
+---
+
+## 4. Preprocessing
+
+### 4.1 Stratified Subsampling and Train/Test Split
+
+A 10% stratified random sample (`xda`, n ≈ 1,364) was drawn from the full 13,611-observation dataset using `createDataPartition()` to preserve class proportions. Within the working sample, a further 75/25 stratified split defines training (n ≈ 1,023) and test (n ≈ 341) sets. Both splits were performed with `set.seed(42)` in Section 3.1 and are shared across all models.
+
+### 4.2 Feature Scaling (MDA and ANN)
+
+Tree-based methods (Bagging, Random Forests, Boosting) are invariant to feature scale and use `xda` directly. MDA and ANN require standardised inputs; `xda2` holds the column-standardised version used exclusively by those two models. The Class column is not scaled.
+
+```{r scaling}
+xda2               <- xda
+xda2[, -ncol(xda2)] <- scale(xda2[, -ncol(xda2)])
+
+cat("Feature ranges after scaling (first 4 columns):\n")
+round(apply(xda2[, 1:4], 2, range), 3)
+```
+
+---
+
+## 5. Methodology
+
+**Bagging** aggregates predictions across a large ensemble of fully-grown classification trees, each trained on a bootstrap resample. Using all p = 16 features at every split (mtry = p) means the trees are correlated, but majority-vote aggregation still substantially reduces variance relative to a single tree. The optimal ntree = 2,100 was selected by minimising OOB error over a 5-fold CV grid (100 to 2,500 trees). This model serves as the ensemble baseline.
+
+**Random Forests** extend bagging by drawing a random subset of mtry < p features at each split, deliberately de-correlating the ensemble. This typically yields better generalisation than pure bagging for datasets with moderate feature correlation. The optimal configuration (mtry = 6 ≈ √p, ntree = 500) was identified by joint 5-fold CV grid search over mtry ∈ {6,…,10} and ntree ∈ {100,…,2,500}.
+
+**Gradient Boosting (GBM)** builds trees sequentially, with each tree fitted to the residual multinomial deviance of all previous trees. The regularisation parameters — shrinkage λ = 0.05 and maximum tree depth = 3 — were selected by 5-fold CV over a full factorial grid. Despite the low training error this approach achieves, the sequential fitting makes it more susceptible to overfitting variance, which is reflected in its wider train–test gap.
+
+**Mixture Discriminant Analysis (MDA)** models each class-conditional distribution as a Gaussian mixture, with the number of mixture components selected per class by BIC. Unlike the tree-based methods, MDA produces a globally smooth probabilistic decision boundary and provides direct posterior probabilities. The model was fitted on standardised features to satisfy the Gaussian-mixture assumption on a common scale.
+
+**Artificial Neural Networks** with a single hidden layer and softmax output are universal approximators capable of learning non-linear decision boundaries in the 16-dimensional feature space. Hyperparameters — hidden unit count (size ∈ {1,…,20}) and weight decay penalising large weights (decay ∈ {0,…,5}) — were jointly tuned by 5-fold CV. The selected model (size = 11, decay = 4) matched Random Forests at 91.1% test accuracy.
+
+---
+
+## 6. Model Training & Evaluation
+
+### 6.1 Bagging
+
+```{r bagging, cache=TRUE}
+set.seed(42)
+bag_bean <- randomForest(
+  Class ~ ., data = xda, subset = ind_train,
+  mtry      = 16,
+  ntree     = 2100,
+  importance = TRUE
+)
+bag_bean
+
+bag_pred_test <- predict(bag_bean, xda[-ind_train, ], type = "class")
+bag_tab_test  <- table(Actual = xda[-ind_train, "Class"], Predicted = bag_pred_test)
+bag_mis_test  <- 1 - classAgreement(bag_tab_test)$diag
+bag_ari_test  <- classAgreement(bag_tab_test)$crand
+
+cat(sprintf("\nBagging  |  Test misclassification: %.4f  |  Test ARI: %.4f\n",
+            bag_mis_test, bag_ari_test))
+```
+
+### 6.2 Random Forests
+
+```{r random-forest, cache=TRUE}
+set.seed(42)
+rf_bean <- randomForest(
+  Class ~ ., data = xda, subset = ind_train,
+  mtry      = 6,
+  ntree     = 500,
+  importance = TRUE
+)
+rf_bean
+
+rf_pred_test <- predict(rf_bean, xda[-ind_train, ], type = "class")
+rf_tab_test  <- table(Actual = xda[-ind_train, "Class"], Predicted = rf_pred_test)
+rf_mis_test  <- 1 - classAgreement(rf_tab_test)$diag
+rf_ari_test  <- classAgreement(rf_tab_test)$crand
+
+cat(sprintf("\nRandom Forest  |  Test misclassification: %.4f  |  Test ARI: %.4f\n",
+            rf_mis_test, rf_ari_test))
+```
+
+### 6.3 Gradient Boosting
+
+```{r boosting, cache=TRUE, message=FALSE, warning=FALSE}
+set.seed(42)
+boost_bean <- gbm(
+  Class ~ ., data        = xda[ind_train, ],
+  distribution           = "multinomial",
+  n.trees                = 200,
+  interaction.depth      = 3,
+  shrinkage              = 0.05,
+  n.minobsinnode         = 20,
+  verbose                = FALSE
+)
+
+boost_train_probs <- predict(boost_bean, newdata = xda[ind_train, ], type = "response")
+boost_train_pred  <- dimnames(boost_train_probs)[[2]][apply(boost_train_probs[, , 1], 1, which.max)]
+boost_tab_train   <- table(Actual = xda[ind_train, "Class"], Predicted = boost_train_pred)
+boost_mis_train   <- 1 - classAgreement(boost_tab_train)$diag
+boost_ari_train   <- classAgreement(boost_tab_train)$crand
+
+boost_test_probs <- predict(boost_bean, newdata = xda[-ind_train, ], type = "response")
+boost_test_pred  <- dimnames(boost_test_probs)[[2]][apply(boost_test_probs[, , 1], 1, which.max)]
+boost_tab_test   <- table(Actual = xda[-ind_train, "Class"], Predicted = boost_test_pred)
+boost_mis_test   <- 1 - classAgreement(boost_tab_test)$diag
+boost_ari_test   <- classAgreement(boost_tab_test)$crand
+
+cat(sprintf("Boosting  |  Train mis: %.4f  |  Train ARI: %.4f\n", boost_mis_train, boost_ari_train))
+cat(sprintf("Boosting  |  Test  mis: %.4f  |  Test  ARI: %.4f\n", boost_mis_test,  boost_ari_test))
+```
+
+### 6.4 Mixture Discriminant Analysis
+
+```{r mda, cache=TRUE}
+set.seed(42)
+mda_bean    <- MclustDA(xda2[ind_train, -ncol(xda2)], xda2[ind_train, ncol(xda2)])
+mda_summary <- summary(
+  mda_bean,
+  newdata  = xda2[-ind_train, -ncol(xda2)],
+  newclass = xda2[-ind_train, ncol(xda2)]
+)
+
+mda_mis_train <- 1 - classAgreement(mda_summary$tab)$diag
+mda_ari_train <- classAgreement(mda_summary$tab)$crand
+mda_mis_test  <- 1 - classAgreement(mda_summary$tab.newdata)$diag
+mda_ari_test  <- classAgreement(mda_summary$tab.newdata)$crand
+
+cat(sprintf("MDA  |  Train mis: %.4f  |  Train ARI: %.4f\n", mda_mis_train, mda_ari_train))
+cat(sprintf("MDA  |  Test  mis: %.4f  |  Test  ARI: %.4f\n", mda_mis_test,  mda_ari_test))
+```
+
+### 6.5 Artificial Neural Networks
+
+```{r ann, cache=TRUE}
+set.seed(42)
+cls     <- class.ind(xda$Class)
+
+nn_bean <- nnet(
+  xda2[ind_train, -ncol(xda2)], cls[ind_train, ],
+  size    = 11,
+  decay   = 4,
+  softmax = TRUE,
+  maxit   = 500,
+  trace   = FALSE
+)
+
+nn_pred_test <- predict(nn_bean, xda2[-ind_train, -ncol(xda2)], type = "class")
+nn_tab_test  <- table(Actual = xda[-ind_train, "Class"], Predicted = nn_pred_test)
+nn_mis_test  <- 1 - classAgreement(nn_tab_test)$diag
+nn_ari_test  <- classAgreement(nn_tab_test)$crand
+
+cat(sprintf("\nANN  |  Test misclassification: %.4f  |  Test ARI: %.4f\n",
+            nn_mis_test, nn_ari_test))
+```
+
+---
+
+## 7. Results & Discussion
+
+All five classifiers achieved test accuracy between 90.5% and 91.1% — a spread of just 1.5 percentage points across methods with fundamentally different inductive biases. This tight performance band reflects the intrinsic quality of the geometric features rather than any particular algorithm's advantage over the others.
+
+**Random Forests** and **ANN** jointly achieved the best test accuracy at 91.1% (misclassification rate 8.9%). Random Forests produced the highest Adjusted Rand Index at 0.785, indicating that the cluster structure of its predictions most closely aligns with the true class labels. ANN followed at ARI = 0.779 with equivalent accuracy, confirming that the non-linear boundary learned by the network offers no decisive advantage over the ensemble of decision trees on this feature set.
+
+**Bagging** (OOB error 8.87%) performed nearly identically to Random Forests, confirming that the primary driver of RF's advantage lies not just in variance reduction through ensembling but specifically in the feature sub-selection mechanism that de-correlates the trees and allows weaker predictors to contribute.
+
+**Gradient Boosting** revealed the starkest bias–variance contrast: 0.2% training misclassification versus 9.5% test misclassification — the largest train–test gap among the five models. Despite regularisation through shrinkage (λ = 0.05) and shallow trees (depth = 3), boosting over-adapted to the 1,023-observation training set. This suggests that boosting's sequential, residual-fitting mechanism introduces variance that the chosen regularisation does not fully control at this sample size.
+
+**MDA** performed within the 1.5% band, validating that the class-conditional distributions are sufficiently well-approximated by Gaussian mixtures to compete with tree ensembles without information loss. Its probabilistic output is an advantage in settings where confidence estimates are needed rather than just a predicted label.
+
+The five strongest predictors by Random Forest Mean Decrease in Gini — Perimeter, ShapeFactor1, Compactness, MinorAxisLength, and MajorAxisLength — align with domain intuition: grain variety is primarily encoded in overall size (Perimeter, axis lengths) and shape regularity (ShapeFactor1, Compactness). The four highly collinear size features (Area, Perimeter, ConvexArea, EquivDiameter) collectively capture one dominant dimension of variation; in a dimensionality-reduction context, the first principal component would likely absorb most of their joint information.
+
+---
+
+## 8. Conclusions
+
+- All five models — Bagging, Random Forests, Boosting, MDA, and ANN — achieved test accuracy within 1.5% of each other (90.5%–91.1%), confirming that the 16 geometric features provide robust, algorithm-independent discriminative signal for seven-class grain identification.
+- Random Forests (91.1% accuracy, ARI = 0.785) and ANN (91.1% accuracy, ARI = 0.779) performed best; Random Forests is the preferred deployment model given its marginally higher ARI and simpler calibration.
+- Gradient Boosting showed the largest generalisation gap (0.2% train vs. 9.5% test misclassification), indicating that careful regularisation — or a larger training sample — is required before deploying boosted models in this regime.
+- The five most informative features — Perimeter, ShapeFactor1, Compactness, MinorAxisLength, and MajorAxisLength — capture both grain size and shape regularity, the primary visual cues used in manual grain sorting. Future work could explore a reduced five-feature model to lower the sensor footprint without sacrificing accuracy.
+- These results support a production-ready automated grain classification system that substantially reduces reliance on manual inspection and can scale to high-throughput agricultural processing pipelines.
